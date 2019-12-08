@@ -230,6 +230,11 @@ static int ct_cb(const struct nlmsghdr* nlh, void* data)
         goto _cleanup;
     nfct_nlmsg_parse(nlh, ct);
 
+    if (!(nfct_getobjopt(ct, NFCT_GOPT_IS_SNAT) == 1 && nfct_getobjopt(ct, NFCT_GOPT_IS_DNAT) == 0))
+        goto _cleanup;
+    if (nfct_get_attr_u8(ct, ATTR_L4PROTO) != IPPROTO_UDP)
+        goto _cleanup;
+
     uint32_t src_ip = nfct_get_attr_u32(ct, ATTR_IPV4_SRC);
     uint16_t src_port = nfct_get_attr_u16(ct, ATTR_PORT_SRC);
     uint32_t dst_ip = nfct_get_attr_u32(ct, ATTR_IPV4_DST);
@@ -243,8 +248,7 @@ static int ct_cb(const struct nlmsghdr* nlh, void* data)
         goto _cleanup;
     if (repl_dst_ip != nat_ip)
         goto _cleanup;
-    if (!(nfct_getobjopt(ct, NFCT_GOPT_IS_SNAT) == 1 && nfct_getobjopt(ct, NFCT_GOPT_IS_DNAT) == 0))
-        goto _cleanup;
+
     fwd_item* item = &fwd_table[repl_dst_port];
     switch (type) {
     case NFCT_T_NEW:
