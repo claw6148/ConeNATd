@@ -2,11 +2,9 @@
 //  main.c
 //  ConeNATd
 //
-//  Created by Chileung Law on 2019/12/6.
+//  Created by Chileung Law on 2020/4/6.
 //  Copyright © 2019 Chileung Law. All rights reserved.
 //
-//  iptables -t mangle -I PREROUTING -p udp -i <ext-if> -m mark ! --mark <fw-mark> -j NFQUEUE --queue-num <dst-nat-queue-num>
-//  iptables -t mangle -I FORWARD -p udp -i <int-if> -o <ext-if> -m mark ! --mark <fw-mark> -j NFQUEUE --queue-num <src-nat-queue-num>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -60,8 +58,9 @@ uint16_t checksum_tcpudp_ipv4(struct iphdr *iph) {
     return checksum(sum, (uint16_t *) payload, len);
 }
 
-#define MIN_PORT    1024
-#define MAX_PORT    65535
+uint16_t min_port = 1024;
+uint16_t max_port = 65535;
+int foreground = 0;
 
 static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_data *nfa, const uint16_t *queue_num) {
     struct nfqnl_msg_packet_hdr *ph = nfq_get_msg_packet_hdr(nfa);
@@ -90,8 +89,9 @@ static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_da
             break;
         }
         if (src_port == 0) {
-            while (1) {
-                src_port = MIN_PORT + (random() % (MAX_PORT - MIN_PORT + 1));
+            int found = 0;
+            for (int i = 0; i < (max_port - min_port); ++i) {
+                src_port = min_port + (random() % (max_port - min_port + 1));
                 fwd_item *item = &fwd_table[src_port];
                 if (item->dst_ip != ip->daddr && now - item->active_time < nat_timeout) {
                     continue;
@@ -99,10 +99,15 @@ static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_da
                 item->dst_port = udp->source;
                 item->dst_ip = ip->saddr;
                 item->active_time = now;
+                found = 1;
                 break;
             }
+            if (found == 0) {
+                if (foreground) printf("All ports are used!\n");
+                goto _out;
+            }
         }
-        {
+        if (foreground) {
             char src_ip_str[0x10];
             inet_ntop(AF_INET, (void *) &ip->saddr, src_ip_str, sizeof(src_ip_str));
             char nat_ip_str[0x10];
@@ -122,7 +127,7 @@ static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_da
         fwd_item *item = &fwd_table[ntohs(udp->dest)];
         if (item->active_time == 0 || now - item->active_time >= nat_timeout) goto _out;
         item->active_time = now;
-        {
+        if (foreground) {
             char src_ip_str[0x10];
             inet_ntop(AF_INET, (void *) &ip->saddr, src_ip_str, sizeof(src_ip_str));
             char nat_ip_str[0x10];
@@ -208,9 +213,8 @@ int main(int argc, char *argv[]) {
     printf("ConeNATd %s %s\n\n", __DATE__, __TIME__);
     uint8_t opt_mark = 0x0;
     char *pid_file = NULL;
-    int foreground = 0;
     int ch;
-    while ((ch = getopt(argc, argv, "n:s:d:t:m:p:f")) != -1) {
+    while ((ch = getopt(argc, argv, "n:s:d:i:x:t:m:p:f")) != -1) {
         switch (ch) {
             case 'n':
                 nat_ip = inet_addr(optarg);
@@ -223,6 +227,12 @@ int main(int argc, char *argv[]) {
             case 'd':
                 qn_dst_nat = atol(optarg);
                 opt_mark |= 1u << 2u;
+                break;
+            case 'i':
+                min_port = atol(optarg);
+                break;
+            case 'x':
+                max_port = atol(optarg);
                 break;
             case 't':
                 nat_timeout = atol(optarg);
@@ -246,21 +256,27 @@ int main(int argc, char *argv[]) {
         }
     }
     if (opt_mark != 0xf) {
-        printf("usage: conenatd -n <src-nat-ip> -s <src-nat-queue-num> -d <dst-nat-queue-num> -m <fw-mark> [-t <nat-timeout>] [-p <pid-file>] [-f foreground]\n");
+        printf("usage: conenatd -n <src-nat-ip> -s <src-nat-queue-num> -d <dst-nat-queue-num> -m <fw-mark> -i <min-port> -x <max-port> [-t <nat-timeout>] [-p <pid-file>] [-f foreground]\n");
         return 0;
+    }
+    if (min_port >= max_port) {
+        printf("Invalid port range!\n");
+        goto _fail;
     }
     {
         char nat_ip_str[0x10];
         inet_ntop(AF_INET, (void *) &nat_ip, nat_ip_str, sizeof(nat_ip_str));
-        printf("nat-ip=%s, src-nat-queue=%d, dst-nat-queue=%d, fw_mark=%d\n", nat_ip_str, qn_src_nat, qn_dst_nat,
-               fw_mark);
-    }
-    if (!foreground && daemon(1, 1) < 0) {
-        printf("daemon() fail\n");
-        goto _fail;
+        printf("nat-ip=%s, src-nat-queue=%d, dst-nat-queue=%d, min-port=%d, max-port=%d, fw_mark=%d\n",
+               nat_ip_str,
+               qn_src_nat,
+               qn_dst_nat,
+               min_port,
+               max_port,
+               fw_mark
+        );
     }
     if (pid_file && write_pid(pid_file)) {
-        printf("write_pid() fail\n");
+        perror("write_pid");
         goto _fail;
     }
 
@@ -271,6 +287,10 @@ int main(int argc, char *argv[]) {
     pthread_create(&th_src_nat, NULL, (void *(*)(void *)) nfq_setup, &qn_src_nat);
     pthread_create(&th_dst_nat, NULL, (void *(*)(void *)) nfq_setup, &qn_dst_nat);
     printf("Running...\n");
+    if (!foreground && daemon(1, 1) < 0) {
+        perror("daemon");
+        goto _fail;
+    }
     void *_not_interested;
     pthread_join(th_src_nat, &_not_interested);
     pthread_join(th_dst_nat, &_not_interested);
