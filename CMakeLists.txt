@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.15)
-project(ConeNATd C)
+project(ConeNATd)
 
-set(CMAKE_C_STANDARD 99)
+set(CMAKE_CXX_STANDARD 14)
 
 link_libraries(pthread)
 link_libraries(netfilter_queue)
 
-add_executable(ConeNATd main.c)
+add_executable(ConeNATd main.cpp)
