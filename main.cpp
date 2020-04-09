@@ -12,7 +12,6 @@
 #include <linux/ip.h>
 #include <linux/netfilter.h>
 #include <linux/udp.h>
-#include <linux/tcp.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +24,8 @@
 #include <thread>
 #include <mutex>
 
+#define HASH
+
 using namespace std;
 
 typedef struct {
@@ -32,21 +33,24 @@ typedef struct {
     uint32_t dst_ip;
     uint16_t dst_port;
     uint16_t nat_port;
-    uint8_t seen_reply;
-    time_t active_time;
-} fwd_item;
+    bool seen_reply = false;
+    time_t active_time = 0;
+} nat_item;
 
-fwd_item dnat_table[0x10000];
 # ifdef HASH
+
 struct pair_hash {
     template<class T1, class T2>
     size_t operator()(const pair<T1, T2> &p) const {
         return hash<T1>{}(p.first) ^ hash<T2>{}(p.first);
     }
 };
-unordered_map<pair<uint32_t, uint16_t>, fwd_item *, pair_hash> snat_table;
+
+unordered_map<pair<uint32_t, uint16_t>, nat_item *, pair_hash> snat_table;
+unordered_map<uint16_t, nat_item> dnat_table;
 # else
-map<pair<uint32_t, uint16_t>, fwd_item *> snat_table;
+map<pair<uint32_t, uint16_t>, nat_item *> snat_table;
+map<uint16_t, nat_item> dnat_table;
 # endif
 
 uint32_t nat_ip;
@@ -88,7 +92,7 @@ static int bind_port(uint16_t port) {
     return fd;
 }
 
-static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_data *nfa, const uint16_t *queue_num) {
+static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *, struct nfq_data *nfa, const uint16_t *queue_num) {
     struct nfqnl_msg_packet_hdr *ph = nfq_get_msg_packet_hdr(nfa);
     bool handled = false;
     uint32_t id = 0;
@@ -110,7 +114,7 @@ static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_da
             src_port = x->nat_port;
         }
         if (src_port == 0) {
-            fwd_item *item = nullptr;
+            nat_item *item = nullptr;
             set<uint16_t> visit_port;
             for (int i = 0; i < (max_port - min_port); ++i) {
                 do {
@@ -137,7 +141,6 @@ static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_da
             item->dst_port = udp->source;
             item->nat_port = src_port;
             item->active_time = now;
-            item->seen_reply = 0;
             snat_table[make_pair(item->dst_ip, item->dst_port)] = item;
 
             if (foreground) {
@@ -166,13 +169,13 @@ static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_da
         handled = true;
     } else if (dnat_qn.find(*queue_num) != dnat_qn.end()) {
         if (ip->daddr != nat_ip) goto _out;
-        fwd_item *item = &dnat_table[ntohs(udp->dest)];
+        nat_item *item = &dnat_table[ntohs(udp->dest)];
         if ((item->active_time == 0) ||
-            ((item->seen_reply == 0 && now - item->active_time >= new_timeout) ||
-             (item->seen_reply == 1 && now - item->active_time >= stream_timeout)))
+            ((!item->seen_reply && now - item->active_time >= new_timeout) ||
+             (item->seen_reply && now - item->active_time >= stream_timeout)))
             goto _out;
         item->active_time = now;
-        if (foreground && item->seen_reply == 0) {
+        if (foreground && !item->seen_reply) {
             char src_ip_str[0x10];
             inet_ntop(AF_INET, (void *) &ip->saddr, src_ip_str, sizeof(src_ip_str));
             char nat_ip_str[0x10];
@@ -185,7 +188,7 @@ static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_da
                    dst_ip_str, ntohs(item->dst_port)
             );
         }
-        item->seen_reply = 1;
+        item->seen_reply = true;
 
         ip->check = update_check32(ip->check, ip->daddr, item->dst_ip);
         udp->check = update_check32(udp->check, ip->daddr, item->dst_ip);
@@ -196,8 +199,14 @@ static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_da
         handled = true;
     }
     _out:
-    return nfq_set_verdict2(qh, id, handled ? NF_ACCEPT : NF_REPEAT, fw_mark, (uint32_t) data_len,
-                            (const unsigned char *) pkt);
+    return nfq_set_verdict2(
+            qh,
+            id,
+            handled ? NF_ACCEPT : NF_REPEAT,
+            fw_mark,
+            (uint32_t) data_len,
+            (const unsigned char *) pkt
+    );
 }
 
 static void nfq_setup(uint16_t queue_num) {
@@ -220,7 +229,6 @@ static void nfq_setup(uint16_t queue_num) {
 }
 
 void write_pid(char *pid_file) {
-    bool ret = false;
     int fd;
     size_t len;
     struct flock lock{};
@@ -306,7 +314,6 @@ int main(int argc, char *argv[]) {
         }
         if (pid_file) write_pid(pid_file);
 
-        memset(dnat_table, 0, sizeof(dnat_table));
         srandom(time(nullptr));
 
         // TODO: Multi-thread
@@ -322,10 +329,10 @@ int main(int argc, char *argv[]) {
             time_t now = time(nullptr);
             mtx.lock();
             for (auto it = snat_table.begin(); it != snat_table.end();) {
-                fwd_item *item = (*it).second;
-                if ((item->active_time) &&
-                    (item->seen_reply == 0 && now - item->active_time >= new_timeout) ||
-                    (item->seen_reply == 1 && now - item->active_time >= stream_timeout)) {
+                nat_item *item = (*it).second;
+                if (item->active_time &&
+                    ((!item->seen_reply && now - item->active_time >= new_timeout) ||
+                     (item->seen_reply && now - item->active_time >= stream_timeout))) {
                     if (foreground) {
                         char src_ip_str[0x10];
                         inet_ntop(AF_INET, (void *) &item->dst_ip, src_ip_str, sizeof(src_ip_str));
