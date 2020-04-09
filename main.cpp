@@ -30,12 +30,14 @@ using namespace std;
 
 typedef struct {
     int fd;
-    uint32_t dst_ip;
-    uint16_t dst_port;
+    uint32_t src_ip;
+    uint16_t src_port;
     uint16_t nat_port;
     bool seen_reply = false;
     time_t active_time = 0;
 } nat_item;
+
+map<uint16_t, set<pair<uint32_t, uint16_t>>> outbound_tuple;
 
 # ifdef HASH
 
@@ -46,25 +48,29 @@ struct pair_hash {
     }
 };
 
-unordered_map<pair<uint32_t, uint16_t>, nat_item *, pair_hash> snat_table;
-unordered_map<uint16_t, nat_item> dnat_table;
+unordered_map<pair<uint32_t, uint16_t>, nat_item *, pair_hash> src_nat_table;
+unordered_map<uint16_t, nat_item> dst_nat_table;
 # else
-map<pair<uint32_t, uint16_t>, nat_item *> snat_table;
-map<uint16_t, nat_item> dnat_table;
+map<pair<uint32_t, uint16_t>, nat_item *> src_nat_table;
+map<uint16_t, nat_item> dst_nat_table;
 # endif
 
+uint8_t nat_type = 1;
 uint32_t nat_ip;
 uint32_t fw_mark;
 uint16_t new_timeout = 60;
 uint16_t stream_timeout = 300;
 uint16_t min_port = 1024;
 uint16_t max_port = 65535;
+uint16_t session_per_src_ip = 0;
 bool foreground = false;
 
-set<uint16_t> snat_qn;
-set<uint16_t> dnat_qn;
+set<uint16_t> src_nat_queue_num_set;
+set<uint16_t> dst_nat_queue_num_set;
+map<uint32_t, uint16_t> session_count;
 
-mutex mtx;
+mutex src_nat_mtx;
+mutex dst_nat_mtx;
 
 static uint16_t update_check16(uint16_t check, uint16_t old_val, uint16_t new_val) {
     uint32_t x = (~check & 0xffffu) + (~old_val & 0xffffu) + new_val;
@@ -94,7 +100,10 @@ static int bind_port(uint16_t port) {
 
 static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *, struct nfq_data *nfa, const uint16_t *queue_num) {
     struct nfqnl_msg_packet_hdr *ph = nfq_get_msg_packet_hdr(nfa);
-    bool handled = false;
+    bool nat = false;
+    bool drop = false;
+    bool lock_src_nat = false;
+    bool lock_dst_nat = false;
     uint32_t id = 0;
     if (ph) id = ntohl(ph->packet_id);
 
@@ -104,27 +113,42 @@ static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *, struct nfq_data *n
     auto *ip = (struct iphdr *) pkt;
     auto *udp = (struct udphdr *) ((uint8_t *) ip + (ip->ihl << 2u));
     if (ip->protocol != IPPROTO_UDP) goto _out;
-    if (snat_qn.find(*queue_num) != snat_qn.end()) {
-        mtx.lock();
-        uint16_t src_port = 0;
+    if (src_nat_queue_num_set.find(*queue_num) != src_nat_queue_num_set.end()) {
+        uint16_t nat_port = 0;
         auto pr = make_pair(ip->saddr, udp->source);
-        if (snat_table.find(pr) != snat_table.end()) {
-            auto *x = snat_table[pr];
+        src_nat_mtx.lock();
+        lock_src_nat = true;
+        if (src_nat_table.find(pr) != src_nat_table.end()) {
+            auto *x = src_nat_table[pr];
             x->active_time = now;
-            src_port = x->nat_port;
+            nat_port = x->nat_port;
         }
-        if (src_port == 0) {
+        if (nat_port == 0) {
+            bool reach_limit = false;
             nat_item *item = nullptr;
             set<uint16_t> visit_port;
+            dst_nat_mtx.lock();
+            lock_dst_nat = true;
             for (int i = 0; i < (max_port - min_port); ++i) {
                 do {
-                    src_port = min_port + (random() % (max_port - min_port + 1));
-                } while (visit_port.find(src_port) != visit_port.end());
-                visit_port.insert(src_port);
-                item = &dnat_table[src_port];
+                    nat_port = min_port + (random() % (max_port - min_port + 1));
+                } while (visit_port.find(nat_port) != visit_port.end());
+                visit_port.insert(nat_port);
+                item = &dst_nat_table[nat_port];
+
+                // Check session limit
+                if (session_per_src_ip) {
+                    if (session_count[ip->saddr] + 1 > session_per_src_ip) {
+                        item = nullptr;
+                        reach_limit = true;
+                        break;
+                    } else {
+                        ++session_count[ip->saddr];
+                    }
+                }
 
                 // Try to reserve the port
-                int fd = bind_port(src_port);
+                int fd = bind_port(nat_port);
                 if (fd) {
                     item->fd = fd;
                     break;
@@ -133,15 +157,20 @@ static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *, struct nfq_data *n
                 item = nullptr;
             }
             if (item == nullptr) {
-                if (foreground) printf("All ports are used!\n");
-                mtx.unlock();
+                if (foreground) {
+                    char src_ip_str[0x10];
+                    inet_ntop(AF_INET, (void *) &ip->saddr, src_ip_str, sizeof(src_ip_str));
+                    printf("No port available for %s!\n", src_ip_str);
+                }
+                if (!reach_limit) --session_count[ip->saddr];
+                drop = true;
                 goto _out;
             }
-            item->dst_ip = ip->saddr;
-            item->dst_port = udp->source;
-            item->nat_port = src_port;
+            item->src_ip = ip->saddr;
+            item->src_port = udp->source;
+            item->nat_port = nat_port;
             item->active_time = now;
-            snat_table[make_pair(item->dst_ip, item->dst_port)] = item;
+            src_nat_table[make_pair(item->src_ip, item->src_port)] = item;
 
             if (foreground) {
                 char src_ip_str[0x10];
@@ -152,28 +181,43 @@ static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *, struct nfq_data *n
                 inet_ntop(AF_INET, (void *) &ip->daddr, dst_ip_str, sizeof(dst_ip_str));
                 printf("[NEW] %15s:%-5d -> %15s:%-5d -> %15s:%-5d\n",
                        src_ip_str, ntohs(udp->source),
-                       nat_ip_str, src_port,
+                       nat_ip_str, nat_port,
                        dst_ip_str, ntohs(udp->dest)
                 );
             }
         }
-        mtx.unlock();
-        src_port = htons(src_port);
+        if (nat_type > 1)
+            outbound_tuple[nat_port].insert(make_pair(ip->daddr, nat_type > 2 ? udp->dest : 0));
+        nat_port = htons(nat_port);
 
         ip->check = update_check32(ip->check, ip->saddr, nat_ip);
         udp->check = update_check32(udp->check, ip->saddr, nat_ip);
-        udp->check = update_check16(udp->check, udp->source, src_port);
+        udp->check = update_check16(udp->check, udp->source, nat_port);
         ip->saddr = nat_ip;
-        udp->source = src_port;
+        udp->source = nat_port;
 
-        handled = true;
-    } else if (dnat_qn.find(*queue_num) != dnat_qn.end()) {
+        nat = true;
+    } else if (dst_nat_queue_num_set.find(*queue_num) != dst_nat_queue_num_set.end()) {
+        dst_nat_mtx.lock();
+        lock_dst_nat = true;
         if (ip->daddr != nat_ip) goto _out;
-        nat_item *item = &dnat_table[ntohs(udp->dest)];
-        if ((item->active_time == 0) ||
+        if (dst_nat_table.find(ntohs(udp->dest)) == dst_nat_table.end()) goto _out;
+        nat_item *item = &dst_nat_table[ntohs(udp->dest)];
+        if (item->active_time == 0 ||
             ((!item->seen_reply && now - item->active_time >= new_timeout) ||
-             (item->seen_reply && now - item->active_time >= stream_timeout)))
+             (item->seen_reply && now - item->active_time >= stream_timeout))) {
+            drop = true;
             goto _out;
+        }
+
+        if (nat_type > 1) {
+            if (outbound_tuple[ntohs(udp->dest)].find(make_pair(ip->saddr, nat_type > 2 ? udp->source : 0)) ==
+                outbound_tuple[ntohs(udp->dest)].end()) {
+                drop = true;
+                goto _out;
+            }
+        }
+
         item->active_time = now;
         if (foreground && !item->seen_reply) {
             char src_ip_str[0x10];
@@ -181,51 +225,60 @@ static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *, struct nfq_data *n
             char nat_ip_str[0x10];
             inet_ntop(AF_INET, (void *) &ip->daddr, nat_ip_str, sizeof(nat_ip_str));
             char dst_ip_str[0x10];
-            inet_ntop(AF_INET, (void *) &item->dst_ip, dst_ip_str, sizeof(dst_ip_str));
+            inet_ntop(AF_INET, (void *) &item->src_ip, dst_ip_str, sizeof(dst_ip_str));
             printf("[EST] %15s:%-5d -> %15s:%-5d -> %15s:%-5d\n",
                    src_ip_str, ntohs(udp->source),
                    nat_ip_str, ntohs(udp->dest),
-                   dst_ip_str, ntohs(item->dst_port)
+                   dst_ip_str, ntohs(item->src_port)
             );
         }
         item->seen_reply = true;
 
-        ip->check = update_check32(ip->check, ip->daddr, item->dst_ip);
-        udp->check = update_check32(udp->check, ip->daddr, item->dst_ip);
-        udp->check = update_check16(udp->check, udp->dest, item->dst_port);
-        ip->daddr = item->dst_ip;
-        udp->dest = item->dst_port;
+        ip->check = update_check32(ip->check, ip->daddr, item->src_ip);
+        udp->check = update_check32(udp->check, ip->daddr, item->src_ip);
+        udp->check = update_check16(udp->check, udp->dest, item->src_port);
+        ip->daddr = item->src_ip;
+        udp->dest = item->src_port;
 
-        handled = true;
+        nat = true;
     }
     _out:
+    if (lock_src_nat) src_nat_mtx.unlock();
+    if (lock_dst_nat) dst_nat_mtx.unlock();
     return nfq_set_verdict2(
             qh,
             id,
-            handled ? NF_ACCEPT : NF_REPEAT,
+            nat ? NF_ACCEPT : drop ? NF_DROP : NF_REPEAT,
             fw_mark,
-            (uint32_t) data_len,
-            (const unsigned char *) pkt
+            nat ? data_len : 0,
+            nat ? (const unsigned char *) pkt : nullptr
     );
 }
 
 static void nfq_setup(uint16_t queue_num) {
-    struct nfq_handle *h;
-    struct nfq_q_handle *qh = nullptr;
-    static uint8_t buf[0x10000];
-    if (!(h = nfq_open())) throw "nfq_open";
-    if (nfq_unbind_pf(h, AF_INET) < 0) throw "nfq_unbind_pf";
-    if (nfq_bind_pf(h, AF_INET) < 0) throw "nfq_bind_pf";
-    if (!(qh = nfq_create_queue(h, queue_num, (nfq_callback *) nfq_cb, (void *) &queue_num))) throw "nfq_create_queue";
-    if (nfq_set_mode(qh, NFQNL_COPY_PACKET, 0xffff) < 0) throw "nfq_set_mode";
-    nfq_set_queue_maxlen(qh, 0x10000);
-    int fd = nfq_fd(h);
-    for (int n; (n = recv(fd, buf, sizeof(buf), 0));) {
-        if (n > 0) nfq_handle_packet(h, (char *) buf, n);
-        else if (foreground) perror("recv");
+    try {
+        struct nfq_handle *h;
+        struct nfq_q_handle *qh = nullptr;
+        static uint8_t buf[0x10000];
+        if (!(h = nfq_open())) throw "nfq_open";
+        if (nfq_unbind_pf(h, AF_INET) < 0) throw "nfq_unbind_pf";
+        if (nfq_bind_pf(h, AF_INET) < 0) throw "nfq_bind_pf";
+        if (!(qh = nfq_create_queue(h, queue_num, (nfq_callback *) nfq_cb, (void *) &queue_num)))
+            throw "nfq_create_queue";
+        if (nfq_set_mode(qh, NFQNL_COPY_PACKET, 0xffff) < 0) throw "nfq_set_mode";
+        nfq_set_queue_maxlen(qh, 0x1000 << 2u);
+        int fd = nfq_fd(h);
+        for (int n; (n = recv(fd, buf, sizeof(buf), 0));) {
+            if (n > 0) nfq_handle_packet(h, (char *) buf, n);
+            else if (foreground) perror("recv");
+        }
+        nfq_destroy_queue(qh);
+        nfq_close(h);
+    } catch (const char *msg) {
+        if (errno) perror(msg);
+        else fprintf(stderr, "%s\n", msg);
+        exit(1);
     }
-    nfq_destroy_queue(qh);
-    nfq_close(h);
 }
 
 void write_pid(char *pid_file) {
@@ -244,24 +297,29 @@ void write_pid(char *pid_file) {
 
 int main(int argc, char *argv[]) {
     try {
-        uint16_t qn_src_nat = 0, qn_dst_nat = 0;
+        uint16_t src_nat_queue_num = 0, dst_nat_queue_num = 0;
         printf("ConeNATd %s %s\n\n", __DATE__, __TIME__);
         uint8_t opt_mark = 0x0;
         char *pid_file = nullptr;
         int ch;
-        while ((ch = getopt(argc, argv, "n:s:d:i:x:t:o:m:p:f")) != -1) {
+        while ((ch = getopt(argc, argv, "n:s:d:i:y:x:t:o:e:m:p:f")) != -1) {
             switch (ch) {
                 case 'n':
                     nat_ip = inet_addr(optarg);
                     opt_mark |= 1u;
                     break;
                 case 's':
-                    qn_src_nat = stol(optarg);
+                    src_nat_queue_num = stol(optarg);
                     opt_mark |= 1u << 1u;
                     break;
                 case 'd':
-                    qn_dst_nat = stol(optarg);
+                    dst_nat_queue_num = stol(optarg);
                     opt_mark |= 1u << 2u;
+                    break;
+                case 'y':
+                    nat_type = stol(optarg);
+                    if (nat_type < 1 || nat_type > 3) throw "Invalid NAT type!";
+//                    nat_type = 1;
                     break;
                 case 'i':
                     min_port = stol(optarg);
@@ -275,9 +333,12 @@ int main(int argc, char *argv[]) {
                 case 'o':
                     stream_timeout = stol(optarg);
                     break;
+                case 'e':
+                    session_per_src_ip = stol(optarg);
+                    break;
                 case 'm':
                     fw_mark = stol(optarg);
-                    if (!fw_mark) throw "fw_mark should not be zero!";
+                    if (!fw_mark) throw "The fw-mark should not be zero!";
                     opt_mark |= 1u << 3u;
                     break;
                 case 'p':
@@ -291,7 +352,21 @@ int main(int argc, char *argv[]) {
             }
         }
         if (opt_mark != 0xf) {
-            printf("usage: conenatd -n <src-nat-ip> -s <src-nat-queue-num> -d <dst-nat-queue-num> -m <fw-mark> [-i <min-port>] [-x <max-port>] [-t <new-timeout>] [-o <stream-timeout>] [-p <pid-file>] [-f foreground]\n");
+            printf(
+                    "Usage: conenatd\n"
+                    "  -n <src-nat-ip>\n"
+                    "  -s <src-nat-queue-num>\n"
+                    "  -d <dst-nat-queue-num>\n"
+                    "  -m <fw-mark>\n"
+                    "  [-y <nat-type> (WIP)]\n"
+                    "  [-i <min-port>]\n"
+                    "  [-x <max-port>]\n"
+                    "  [-t <new-timeout>]\n"
+                    "  [-o <stream-timeout>]\n"
+                    "  [-e <session-per-src-ip>]\n"
+                    "  [-p <pid-file>]\n"
+                    "  [-f foreground]\n"
+            );
             return 0;
         }
         if (min_port >= max_port) throw "Invalid port range!";
@@ -301,15 +376,28 @@ int main(int argc, char *argv[]) {
         {
             char nat_ip_str[0x10];
             inet_ntop(AF_INET, (void *) &nat_ip, nat_ip_str, sizeof(nat_ip_str));
-            printf("nat-ip=%s, src-nat-queue=%d, dst-nat-queue=%d, min-port=%d, max-port=%d, fw_mark=%d, new-timeout=%d, stream-timeout=%d\n",
-                   nat_ip_str,
-                   qn_src_nat,
-                   qn_dst_nat,
-                   min_port,
-                   max_port,
-                   fw_mark,
-                   new_timeout,
-                   stream_timeout
+            printf(
+                    "src-nat-ip=%s\n"
+                    "src-nat-queue-num=%d\n"
+                    "dst-nat-queue-num=%d\n"
+                    "fw-mark=%d\n"
+                    "nat-type=%s\n"
+                    "min-port=%d\n"
+                    "max-port=%d\n"
+                    "new-timeout=%d\n"
+                    "stream-timeout=%d\n"
+                    "session-per-src-ip=%d\n"
+                    "\n",
+                    nat_ip_str,
+                    src_nat_queue_num,
+                    dst_nat_queue_num,
+                    fw_mark,
+                    nat_type == 1 ? "full-cone" : nat_type == 2 ? "address-restricted-cone" : "port-restricted-cone",
+                    min_port,
+                    max_port,
+                    new_timeout,
+                    stream_timeout,
+                    session_per_src_ip
             );
         }
         if (pid_file) write_pid(pid_file);
@@ -318,42 +406,53 @@ int main(int argc, char *argv[]) {
 
         // TODO: Multi-thread
         for (int i = 0; i < 1; ++i) {
-            snat_qn.insert(qn_src_nat);
-            thread(nfq_setup, qn_src_nat++).detach();
-            dnat_qn.insert(qn_dst_nat);
-            thread(nfq_setup, qn_dst_nat++).detach();
+            src_nat_queue_num_set.insert(src_nat_queue_num);
+            thread(nfq_setup, src_nat_queue_num++).detach();
+            dst_nat_queue_num_set.insert(dst_nat_queue_num);
+            thread(nfq_setup, dst_nat_queue_num++).detach();
         }
 
         printf("Running...\n");
         while (true) {
             time_t now = time(nullptr);
-            mtx.lock();
-            for (auto it = snat_table.begin(); it != snat_table.end();) {
+            src_nat_mtx.lock();
+            for (auto it = src_nat_table.begin(); it != src_nat_table.end();) {
                 nat_item *item = (*it).second;
                 if (item->active_time &&
                     ((!item->seen_reply && now - item->active_time >= new_timeout) ||
                      (item->seen_reply && now - item->active_time >= stream_timeout))) {
                     if (foreground) {
                         char src_ip_str[0x10];
-                        inet_ntop(AF_INET, (void *) &item->dst_ip, src_ip_str, sizeof(src_ip_str));
+                        inet_ntop(AF_INET, (void *) &item->src_ip, src_ip_str, sizeof(src_ip_str));
                         char nat_ip_str[0x10];
                         inet_ntop(AF_INET, (void *) &nat_ip, nat_ip_str, sizeof(nat_ip_str));
                         printf("[DEL] %15s:%-5d <> %15s:%-5d\n",
-                               src_ip_str, ntohs(item->dst_port),
+                               src_ip_str, ntohs(item->src_port),
                                nat_ip_str, item->nat_port
                         );
                     }
+                    if (session_per_src_ip) {
+                        if (--session_count[item->src_ip] <= 0)
+                            session_count.erase(item->src_ip);
+                    }
                     close(item->fd);
-                    it = snat_table.erase(it);
+
+                    dst_nat_mtx.lock();
+                    dst_nat_table.erase(item->nat_port);
+                    if (nat_type > 1) outbound_tuple.erase(item->nat_port);
+                    dst_nat_mtx.unlock();
+
+                    it = src_nat_table.erase(it);
                     continue;
                 }
                 ++it;
             }
-            mtx.unlock();
+            src_nat_mtx.unlock();
             sleep(1);
         }
     } catch (const char *msg) {
-        printf("%s\n", msg);
+        if (errno) perror(msg);
+        else fprintf(stderr, "%s\n", msg);
+        exit(1);
     }
-    return 1;
 }
