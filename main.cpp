@@ -37,8 +37,6 @@ typedef struct {
     time_t active_time = 0;
 } nat_item;
 
-map<uint16_t, set<pair<uint32_t, uint16_t>>> outbound_tuple;
-
 # ifdef HASH
 
 struct pair_hash {
@@ -55,7 +53,6 @@ map<pair<uint32_t, uint16_t>, nat_item *> src_nat_table;
 map<uint16_t, nat_item> dst_nat_table;
 # endif
 
-uint8_t nat_type = 1;
 uint32_t nat_ip;
 uint32_t fw_mark;
 uint16_t new_timeout = 60;
@@ -65,12 +62,13 @@ uint16_t max_port = 65535;
 uint16_t session_per_src_ip = 0;
 bool foreground = false;
 
-set<uint16_t> src_nat_queue_num_set;
-set<uint16_t> dst_nat_queue_num_set;
 map<uint32_t, uint16_t> session_count;
 
 mutex src_nat_mtx;
 mutex dst_nat_mtx;
+
+uint16_t src_nat_queue_num;
+uint16_t dst_nat_queue_num;
 
 static uint16_t update_check16(uint16_t check, uint16_t old_val, uint16_t new_val) {
     uint32_t x = (~check & 0xffffu) + (~old_val & 0xffffu) + new_val;
@@ -110,10 +108,13 @@ static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *, struct nfq_data *n
     time_t now = time(nullptr);
     void *pkt;
     int data_len = nfq_get_payload(nfa, (unsigned char **) &pkt);
-    auto *ip = (struct iphdr *) pkt;
-    auto *udp = (struct udphdr *) ((uint8_t *) ip + (ip->ihl << 2u));
+    if (data_len <= 0) goto _out;
+    struct iphdr *ip;
+    ip = (struct iphdr *) pkt;
+    struct udphdr *udp;
+    udp = (struct udphdr *) ((uint8_t *) ip + (ip->ihl << 2u));
     if (ip->protocol != IPPROTO_UDP) goto _out;
-    if (src_nat_queue_num_set.find(*queue_num) != src_nat_queue_num_set.end()) {
+    if (*queue_num == src_nat_queue_num) {
         uint16_t nat_port = 0;
         auto pr = make_pair(ip->saddr, udp->source);
         src_nat_mtx.lock();
@@ -186,8 +187,6 @@ static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *, struct nfq_data *n
                 );
             }
         }
-        if (nat_type > 1)
-            outbound_tuple[nat_port].insert(make_pair(ip->daddr, nat_type > 2 ? udp->dest : 0));
         nat_port = htons(nat_port);
 
         ip->check = update_check32(ip->check, ip->saddr, nat_ip);
@@ -197,7 +196,7 @@ static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *, struct nfq_data *n
         udp->source = nat_port;
 
         nat = true;
-    } else if (dst_nat_queue_num_set.find(*queue_num) != dst_nat_queue_num_set.end()) {
+    } else if (*queue_num == dst_nat_queue_num) {
         dst_nat_mtx.lock();
         lock_dst_nat = true;
         if (ip->daddr != nat_ip) goto _out;
@@ -208,14 +207,6 @@ static int nfq_cb(struct nfq_q_handle *qh, struct nfgenmsg *, struct nfq_data *n
              (item->seen_reply && now - item->active_time >= stream_timeout))) {
             drop = true;
             goto _out;
-        }
-
-        if (nat_type > 1) {
-            if (outbound_tuple[ntohs(udp->dest)].find(make_pair(ip->saddr, nat_type > 2 ? udp->source : 0)) ==
-                outbound_tuple[ntohs(udp->dest)].end()) {
-                drop = true;
-                goto _out;
-            }
         }
 
         item->active_time = now;
@@ -297,12 +288,11 @@ void write_pid(char *pid_file) {
 
 int main(int argc, char *argv[]) {
     try {
-        uint16_t src_nat_queue_num = 0, dst_nat_queue_num = 0;
         printf("ConeNATd %s %s\n\n", __DATE__, __TIME__);
         uint8_t opt_mark = 0x0;
         char *pid_file = nullptr;
         int ch;
-        while ((ch = getopt(argc, argv, "n:s:d:i:y:x:t:o:e:m:p:f")) != -1) {
+        while ((ch = getopt(argc, argv, "n:s:d:i:x:t:o:e:m:p:f")) != -1) {
             switch (ch) {
                 case 'n':
                     nat_ip = inet_addr(optarg);
@@ -315,11 +305,6 @@ int main(int argc, char *argv[]) {
                 case 'd':
                     dst_nat_queue_num = stol(optarg);
                     opt_mark |= 1u << 2u;
-                    break;
-                case 'y':
-                    nat_type = stol(optarg);
-                    if (nat_type < 1 || nat_type > 3) throw "Invalid NAT type!";
-//                    nat_type = 1;
                     break;
                 case 'i':
                     min_port = stol(optarg);
@@ -381,7 +366,6 @@ int main(int argc, char *argv[]) {
                     "src-nat-queue-num=%d\n"
                     "dst-nat-queue-num=%d\n"
                     "fw-mark=%d\n"
-                    "nat-type=%s\n"
                     "min-port=%d\n"
                     "max-port=%d\n"
                     "new-timeout=%d\n"
@@ -392,7 +376,6 @@ int main(int argc, char *argv[]) {
                     src_nat_queue_num,
                     dst_nat_queue_num,
                     fw_mark,
-                    nat_type == 1 ? "full-cone" : nat_type == 2 ? "address-restricted-cone" : "port-restricted-cone",
                     min_port,
                     max_port,
                     new_timeout,
@@ -404,13 +387,8 @@ int main(int argc, char *argv[]) {
 
         srandom(time(nullptr));
 
-        // TODO: Multi-thread
-        for (int i = 0; i < 1; ++i) {
-            src_nat_queue_num_set.insert(src_nat_queue_num);
-            thread(nfq_setup, src_nat_queue_num++).detach();
-            dst_nat_queue_num_set.insert(dst_nat_queue_num);
-            thread(nfq_setup, dst_nat_queue_num++).detach();
-        }
+        thread(nfq_setup, src_nat_queue_num).detach();
+        thread(nfq_setup, dst_nat_queue_num).detach();
 
         printf("Running...\n");
         while (true) {
@@ -439,7 +417,6 @@ int main(int argc, char *argv[]) {
 
                     dst_nat_mtx.lock();
                     dst_nat_table.erase(item->nat_port);
-                    if (nat_type > 1) outbound_tuple.erase(item->nat_port);
                     dst_nat_mtx.unlock();
 
                     it = src_nat_table.erase(it);
