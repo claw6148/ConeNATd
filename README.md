@@ -33,8 +33,8 @@ SNAT_QN=1001
 DNAT_QN=1002
 FW_MARK=2000
 
-iptables -t mangle -I PREROUTING -i ${EXT_IF} -p udp -m mark ! --mark ${FW_MARK} -j NFQUEUE --queue-num ${DNAT_QN}
-iptables -t mangle -I FORWARD -i ${INT_IF} -o ${EXT_IF} -p udp -m mark ! --mark ${FW_MARK} -j NFQUEUE --queue-num ${SNAT_QN}
+iptables -t mangle -I PREROUTING -p udp -i ${EXT_IF} -d ${NAT_IP} -m mark ! --mark ${FW_MARK} -j NFQUEUE --queue-num ${DNAT_QN}
+iptables -t mangle -I FORWARD -p udp -i ${INT_IF} -o ${EXT_IF} ! -d ${NAT_IP} -m mark ! --mark ${FW_MARK} -j NFQUEUE --queue-num ${SNAT_QN}
 iptables -t nat -I POSTROUTING -o ${EXT_IF} -p udp -m mark --mark ${FW_MARK} -j ACCEPT
 
 conenatd -n ${NAT_IP} -s ${SNAT_QN} -d ${DNAT_QN} -m ${FW_MARK}
