@@ -1,6 +1,10 @@
 # ConeNATd
 基于NFQUEUE的用户模式Full-cone NAT实现。
 
+## 新项目
+
+https://github.com/claw6148/TPConeNATd
+
 ## 用法
 
 ```
